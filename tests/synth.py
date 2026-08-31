@@ -43,7 +43,7 @@ class Scene:
 
     def __init__(self, w=1200, h=800, focal_35mm=28.0, pitch_deg=0.0, roll_deg=0.0,
                  yaw_deg=0.0, seed=0, clutter=40, noise=3.0, corner=False,
-                 texture=True):
+                 texture=True, half_timbered=False, brace_lean_deg=28.0):
         self.w, self.h = w, h
         self.f = focal_35mm * math.hypot(w, h) / math.hypot(36.0, 24.0)
         self.K = np.array([[self.f, 0, w / 2.0], [0, self.f, h / 2.0], [0, 0, 1.0]])
@@ -53,11 +53,16 @@ class Scene:
         # camera rotation: world -> camera
         self.R = rot_x(-self.pitch) @ rot_z(-self.roll) @ rot_y(self.yaw)
         self.rng = np.random.default_rng(seed)
+        self.half_timbered = half_timbered
+        self.brace_lean = math.radians(brace_lean_deg)
         self.img = np.full((h, w, 3), 232, np.uint8)
         self._sky()
-        self._facade(0.0)
+        if half_timbered:
+            self._timber_facade(0.0)
+        else:
+            self._facade(0.0)
         if corner:
-            self._facade(math.pi / 2.4, x0=6.0)
+            (self._timber_facade if half_timbered else self._facade)(math.pi / 2.4, x0=6.0)
         self._ground()
         if clutter:
             self._clutter(clutter)
@@ -112,6 +117,74 @@ class Scene:
         # gable: two strong diagonals, the classic false-vanishing-point trap
         self.seg(P(0, top), P(width / 2, top - 3.2), (48, 46, 44), 4)
         self.seg(P(width / 2, top - 3.2), P(width, top), (48, 46, 44), 4)
+
+    def _timber_facade(self, yaw, x0=-6.0, width=12.0, top=-9.0, bottom=3.0, z=16.0):
+        """A half-timbered wall: posts, rails, and a great many diagonal braces.
+
+        This is the adversarial case for a vertical-lines method, and it is
+        adversarial in a specific way rather than merely noisy.  A brace leaning
+        25-30 deg off vertical sits *inside* the vertical candidate window, and
+        the braces come in mirrored pairs at a consistent angle, so they form a
+        strong, coherent false vanishing point rather than scattered noise.  A
+        detector that merely down-weights outliers is not enough; the angular
+        prior and the horizon cross-check have to earn their place here.
+        """
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        def P(u, v):
+            return (x0 + u * c, v, z + u * s_)
+        wall = [self.project(P(0, top)), self.project(P(width, top)),
+                self.project(P(width, bottom)), self.project(P(0, bottom))]
+        if all(p is not None for p in wall):
+            cv2.fillPoly(self.img, [np.round(np.array(wall)).astype(np.int32)],
+                         (206, 208, 212))
+        timber = (58, 66, 92)
+        posts = np.linspace(0, width, 9)
+        rails = np.linspace(top, bottom, 5)
+        for u in posts:
+            self.seg(P(u, top), P(u, bottom), timber, 4)
+        for v in rails:
+            self.seg(P(0, v), P(width, v), timber, 4)
+        # braces: one per bay, mirrored about the centre of each storey, plus a
+        # St Andrew's cross in every other bay
+        lean = math.tan(self.brace_lean)
+        for storey in range(len(rails) - 1):
+            v0, v1 = rails[storey], rails[storey + 1]
+            dv = v1 - v0
+            for k in range(len(posts) - 1):
+                a, b = posts[k], posts[k + 1]
+                # NOT clipped to the bay: a brace clipped to a narrow bay ends
+                # up near 45 deg, safely outside the vertical window, and the
+                # test stops testing anything.  Real "wilder Mann" bracing runs
+                # across bays, and a brace at `brace_lean_deg` off vertical is
+                # the case that actually lands inside the candidate window.
+                run = dv * lean
+                if k % 2 == 0:
+                    self.seg(P(a, v1), P(min(a + run, width), v0), timber, 3)
+                    self.seg(P(b, v1), P(max(b - run, 0.0), v0), timber, 3)
+                else:
+                    self.seg(P(a, v0), P(min(a + run, width), v1), timber, 3)
+                    self.seg(P(b, v0), P(max(b - run, 0.0), v1), timber, 3)
+                if k % 3 == 1:                       # Andreaskreuz
+                    self.seg(P(a, v0), P(b, v1), timber, 3)
+                    self.seg(P(b, v0), P(a, v1), timber, 3)
+        # windows sit between the posts
+        for k in range(0, len(posts) - 1, 2):
+            for storey in range(len(rails) - 1):
+                a = posts[k] + 0.25
+                b = posts[k + 1] - 0.25
+                v0 = rails[storey] + 0.35
+                v1 = rails[storey + 1] - 0.35
+                if b <= a or v1 <= v0:
+                    continue
+                for (p, q) in ((P(a, v0), P(b, v0)), (P(a, v1), P(b, v1)),
+                               (P(a, v0), P(a, v1)), (P(b, v0), P(b, v1))):
+                    self.seg(p, q, (70, 74, 84), 2)
+        # a steep gable with rafters -- more long diagonals, near the top
+        apex = top - 4.5
+        self.seg(P(0, top), P(width / 2, apex), timber, 5)
+        self.seg(P(width / 2, apex), P(width, top), timber, 5)
+        for t in np.linspace(0.18, 0.82, 6):
+            self.seg(P(width * t, top), P(width / 2, apex), timber, 2)
 
     def _ground(self):
         for z in np.linspace(9.0, 26.0, 7):

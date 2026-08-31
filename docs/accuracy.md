@@ -107,6 +107,40 @@ mistake.
 0.85 cuts over-corrections by 40 % at no cost in mean accuracy. It applies to
 pitch only, and only when the focal length was not supplied.
 
+## Half-timbered facades: the shallow brace, not the steep one
+
+Fachwerk is the adversarial case for a vertical-lines method, and it is
+adversarial in a specific way. Braces come in mirrored pairs at a consistent
+angle, so they form a *coherent* false vanishing point rather than scattered
+noise. 20 scenes (brace lean x pitch/roll), focal length supplied so the focal
+prior does not mask the effect:
+
+| brace lean off vertical | pitch mean | pitch max |
+|---|---|---|
+| **20 deg** | **0.85 deg** | **3.24 deg** |
+| 25 deg | 0.55 deg | 1.68 deg |
+| 28 deg | 0.20 deg | 0.66 deg |
+| 31 deg | 0.11 deg | 0.37 deg |
+| 45 deg | 0.47 deg | 1.40 deg |
+
+The steep 45 deg brace is harmless: it falls outside any plausible candidate
+window. The dangerous one is the shallow 20 deg brace, which sits deep inside
+it. Roll is unaffected throughout (worst 0.47 deg).
+
+The fix is weighting, not gating:
+
+| vertical window | prior softness | Fachwerk pitch max | plain facade pitch mean |
+|---|---|---|---|
+| 32 deg | 0.60 | 3.24 deg | 0.12 deg |
+| 18 deg | 0.60 | 3.28 deg | 0.12 deg |
+| 32 deg | **0.35** | **1.36 deg** | 0.12 deg |
+| 18 deg | 0.35 | 1.37 deg | 0.11 deg |
+
+Narrowing the window from 32 deg to 18 deg moves the worst error by 0.04 deg.
+Sharpening the prior from 0.6 to 0.35 cuts it by 58 %, at no cost on plain
+facades. `angular_softness` is 0.35 by default because of this table;
+`--angular-softness` exposes it.
+
 ## Known weakness
 
 A flat-on facade with no EXIF is the hard case and the common one for web

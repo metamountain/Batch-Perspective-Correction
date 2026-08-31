@@ -197,20 +197,28 @@ class LineSet:
         return out
 
 
-def angular_prior(angle: np.ndarray, window: float, softness: float = 0.6) -> np.ndarray:
+def angular_prior(angle: np.ndarray, window: float, softness: float = 0.35) -> np.ndarray:
     """Down-weight lines the further they lean away from the expected axis.
 
     A hard angular window alone throws away a 31 deg facade edge and fully
-    trusts a 29 deg roof rafter.  A smooth prior inside the window makes the
-    fit prefer the lines that were probably vertical in the world, which is the
-    "nach Laenge *und* Winkel gewichten" part.
+    trusts a 29 deg roof rafter.  A smooth prior inside the window makes the fit
+    prefer the lines that were probably vertical in the world.
+
+    ``softness`` does nearly all the work, and the hard window almost none.
+    Measured on half-timbered scenes -- posts, rails and a great many diagonal
+    braces -- narrowing the window from 32 deg to 18 deg changed the worst pitch
+    error by 0.04 deg, while sharpening the prior from 0.6 to 0.35 cut it from
+    3.24 deg to 1.36 deg, with no cost on plain facades.  The dangerous line in
+    half-timbered work is not the steep 45 deg brace, which falls outside any
+    window; it is the shallow 20 deg one, which sits deep inside it and can only
+    be handled by weighting.  See docs/accuracy.md.
     """
     x = np.clip(angle / max(window, 1e-6), 0.0, 1.0)
     return np.exp(-(x * x) / (2.0 * softness * softness))
 
 
 def split_by_orientation(ls: LineSet, vertical_window_deg: float,
-                         horizontal_window_deg: float):
+                         horizontal_window_deg: float, softness: float = 0.35):
     """Return ``(vertical, horizontal)`` line sets with weights already applied."""
     if len(ls) == 0:
         return ls, ls
@@ -223,9 +231,10 @@ def split_by_orientation(ls: LineSet, vertical_window_deg: float,
     vert = ls.subset(vmask)
     horiz = ls.subset(hmask)
     if len(vert):
-        vert.weight = vert.length * angular_prior(vert.angle_to_vert, vw)
+        vert.weight = vert.length * angular_prior(vert.angle_to_vert, vw, softness)
     if len(horiz):
-        horiz.weight = horiz.length * angular_prior(math.pi / 2.0 - horiz.angle_to_vert, hw)
+        horiz.weight = horiz.length * angular_prior(math.pi / 2.0 - horiz.angle_to_vert,
+                                                    hw, softness)
     return vert, horiz
 
 
@@ -244,5 +253,6 @@ def prepare(gray: np.ndarray, settings) -> tuple:
         seg = seg[G.segment_lengths(seg) >= min_len]
     ls = LineSet(seg if len(seg) else np.zeros((0, 4)))
     vert, horiz = split_by_orientation(ls, settings.vertical_window_deg,
-                                       settings.horizontal_window_deg)
+                                       settings.horizontal_window_deg,
+                                       settings.angular_softness)
     return ls, vert, horiz, name

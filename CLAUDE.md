@@ -85,6 +85,24 @@ than a few hundred px, because its positional uncertainty is `R·σ_θ`.
 **Lesson:** the elegant estimator lost to the dumb prior. Measure before
 believing, and keep the losing branch documented rather than deleted.
 
+## Fachwerk: it is the *shallow* brace that is dangerous
+
+Half-timbered facades are the adversarial case, and the intuition about why is
+backwards. The steep 45° brace is harmless — it falls outside any plausible
+candidate window. The killer is the **20° brace**, deep inside the window, and
+braces come in mirrored pairs at a consistent angle so they form a *coherent*
+false vanishing point rather than scattered noise. Worst pitch error by brace
+lean: 20° → **3.24°**, 25° → 1.68°, 28° → 0.66°, 31° → 0.37°, 45° → 1.40°.
+
+And the fix is **weighting, not gating**. Narrowing the vertical window from 32°
+to 18° moves the worst error by 0.04°. Sharpening `angular_softness` from 0.6 to
+0.35 cuts it 58 % (3.24° → 1.36°) at zero cost on plain facades. That is why the
+default is 0.35 and why the window is still a generous 32°.
+
+Roll survives all of it (worst 0.47°). And on Fachwerk *without* a known focal
+length the confidence diagnostics report `weakest: focal` in every single case —
+the diagonals are not what limits accuracy there, the focal prior is.
+
 ## One idea measurement accepted
 
 **Damping pitch by 0.85 when the focal length is a guess.** The error is

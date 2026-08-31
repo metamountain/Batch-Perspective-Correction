@@ -114,6 +114,9 @@ def build_parser():
                    help="minimum line length as a fraction of the short edge")
     g.add_argument("--inlier-threshold", type=float, default=Settings.inlier_threshold_deg,
                    help="RANSAC inlier band, degrees")
+    g.add_argument("--angular-softness", type=float, default=Settings.angular_softness,
+                   help="how sharply leaning lines are down-weighted; lower is stricter, "
+                        "which helps on half-timbered facades")
     g.add_argument("--seed", type=int, default=Settings.seed)
     g.add_argument("--merge-lines", action="store_true",
                    help="join collinear fragments before fitting (measurably worse; "
@@ -147,6 +150,7 @@ def settings_from(args) -> Settings:
     s.detect_max_edge = args.detect_max_edge
     s.min_line_length_frac = args.min_line_length
     s.inlier_threshold_deg = args.inlier_threshold
+    s.angular_softness = args.angular_softness
     s.seed = args.seed
     s.merge_lines = args.merge_lines
     s.focal_35mm = args.focal_35mm

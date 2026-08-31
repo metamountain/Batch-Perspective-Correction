@@ -17,6 +17,10 @@ class Settings:
     min_line_length_frac: float = 0.035  # of the short edge
     vertical_window_deg: float = 32.0
     horizontal_window_deg: float = 32.0
+    # Sharpness of the angular weighting inside the window.  This, not the
+    # window width, is what keeps half-timbered bracing out of the fit; see
+    # lines.angular_prior and docs/accuracy.md.
+    angular_softness: float = 0.35
     border_margin_px: int = 3
     # Off by default: merging measurably costs accuracy.  Joining a broken
     # facade edge into one long line sounded right -- it is what a

@@ -85,3 +85,37 @@ def test_gable_diagonals_do_not_become_the_vertical_direction():
     _, dp, m = _err(sc, Settings().replace(focal_35mm=28))
     assert abs(dp) < 2.0
     assert abs(math.degrees(m.roll)) < 2.0
+
+
+def test_half_timbered_bracing_does_not_capture_the_vertical_direction():
+    """Half-timbered facades are the adversarial case, and specifically so.
+
+    A brace leaning 20-30 deg off vertical sits *inside* the vertical candidate
+    window, and braces come in mirrored pairs at a consistent angle, so they
+    form a coherent false vanishing point rather than scattered noise.  The
+    steep 45 deg brace is harmless -- it falls outside any window.  The shallow
+    one can only be handled by weighting.
+    """
+    worst_pitch = worst_roll = 0.0
+    for lean in (20, 25, 28, 31, 45):
+        for pitch, roll in ((3, -1.5), (6, 2), (10, 0), (14, -3)):
+            sc = synth.Scene(w=1400, h=1000, focal_35mm=28, pitch_deg=pitch,
+                             roll_deg=roll, seed=3, half_timbered=True,
+                             brace_lean_deg=lean, clutter=25)
+            dr, dp, _ = _err(sc, Settings().replace(focal_35mm=28))
+            worst_pitch = max(worst_pitch, abs(dp))
+            worst_roll = max(worst_roll, abs(dr))
+    assert worst_roll < 0.6, f"roll error {worst_roll:.3f} deg on half-timbered work"
+    assert worst_pitch < 2.0, f"pitch error {worst_pitch:.3f} deg on half-timbered work"
+
+
+def test_a_sharper_angular_prior_is_what_helps_on_bracing():
+    """Pins the measured finding: the weighting does the work, not the window."""
+    from bpc import lines as L
+    lean = np.radians([0.0, 10.0, 20.0, 30.0])
+    window = math.radians(32.0)
+    soft = L.angular_prior(lean, window, 0.35)
+    loose = L.angular_prior(lean, window, 0.60)
+    assert soft[0] == loose[0] == 1.0
+    assert np.all(soft[1:] < loose[1:]), "0.35 must down-weight leaning lines harder"
+    assert soft[2] < 0.5, "a 20 deg brace must lose at least half its weight"
