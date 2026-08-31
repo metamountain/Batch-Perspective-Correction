@@ -1,0 +1,255 @@
+"""Interactive review state: manual correction and line editing.
+
+Kept deliberately free of any GUI toolkit.  Everything the manual mode does --
+re-fit from a hand-picked subset of lines, nudge the angles by hand, render a
+before/after pair -- is a pure function of state here, so it can be tested
+headlessly and driven from Tkinter, a notebook or a future web front end alike.
+
+The interaction the brief asked for is "Slider zur manuellen Korrektur oder
+Auswahl von Linien zur Bestaetigung bzw. Loeschung".  Both are supported and
+they compose: disabling the roof rafters that the detector mistook for
+verticals re-fits the model, and the sliders then start from that better fit
+instead of from the bad one.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import cv2
+import numpy as np
+
+from . import geometry as G
+from . import imageio as IO
+from . import lines as L
+from . import model as M
+from . import preview as PV
+from . import warp as W
+
+AUTO, MANUAL = "auto", "manual"
+
+
+class ReviewSession:
+    """Everything needed to review and fix one image."""
+
+    def __init__(self, path: str, settings, image=None):
+        self.path = path
+        self.settings = settings
+        if image is None:
+            self.src = IO.load(path)
+            self.bgr = self.src.bgr
+        else:
+            self.src = IO.Loaded(bgr=image, exif_bytes=None, icc=None, focal_35mm=None,
+                                 orientation=1, fmt="", path=path)
+            self.bgr = image
+        self.h, self.w = self.bgr.shape[:2]
+
+        self.gray, self.scale = IO.analysis_gray(self.bgr, settings.detect_max_edge)
+        _, self.vert, self.horiz, self.detector = L.prepare(self.gray, settings)
+        # per-line manual state: True = may be used, False = struck out by the user
+        self.enabled = np.ones(len(self.vert), dtype=bool)
+
+        self.mode = AUTO
+        self.manual_roll = 0.0
+        self.manual_pitch = 0.0
+        self.manual_focal_35mm = 0.0
+        self.model = None
+        self.refit()
+
+    # -- fitting ---------------------------------------------------------
+    def refit(self):
+        """Re-run the estimator over the currently enabled lines."""
+        vert = self.vert.subset(self.enabled)
+        gh, gw = self.gray.shape[:2]
+        exif_px = IO.focal_px_from_exif(self.src, self.w, self.h) \
+            if self.settings.use_exif_focal else None
+        m = M.estimate(vert, self.horiz, gw, gh, self.settings,
+                       exif_px * self.scale if exif_px else None)
+        if m.f:
+            m.f = m.f / self.scale
+        # map the inlier mask back onto the full line list, so the overlay can
+        # distinguish "not an inlier" from "struck out by the user"
+        full = np.zeros(len(self.vert), dtype=bool)
+        if m.vert_inliers is not None and len(m.vert_inliers) == int(self.enabled.sum()):
+            full[np.flatnonzero(self.enabled)] = m.vert_inliers
+        m.vert_inliers = full
+        self.model = m
+        if self.mode == AUTO:
+            self.manual_roll, self.manual_pitch = m.roll, m.pitch
+            self.manual_focal_35mm = M.focal_35mm_from_px(m.f, self.w, self.h) if m.f else 0.0
+        return m
+
+    # -- manual controls -------------------------------------------------
+    def set_manual(self, roll_deg=None, pitch_deg=None, focal_35mm=None):
+        self.mode = MANUAL
+        if roll_deg is not None:
+            self.manual_roll = math.radians(roll_deg)
+        if pitch_deg is not None:
+            self.manual_pitch = math.radians(pitch_deg)
+        if focal_35mm is not None:
+            self.manual_focal_35mm = float(focal_35mm)
+
+    def reset_to_auto(self):
+        self.mode = AUTO
+        self.enabled[:] = True
+        self.refit()
+
+    def toggle_line(self, index: int):
+        if 0 <= index < len(self.enabled):
+            self.enabled[index] = not self.enabled[index]
+            self.refit()
+            return True
+        return False
+
+    def disable_lines_by_angle(self, min_deg: float):
+        """Strike out every candidate leaning more than ``min_deg`` off vertical.
+
+        The one-click version of "delete the slanted ones": roof rafters and
+        gable edges are what most often drag a facade fit off, and they are
+        exactly the lines with the largest lean.
+        """
+        lean = np.degrees(self.vert.angle_to_vert)
+        changed = (lean > min_deg) & self.enabled
+        self.enabled[changed] = False
+        if changed.any():
+            self.refit()
+        return int(changed.sum())
+
+    def pick_line(self, x: float, y: float, display_scale: float = 1.0, radius: float = 12.0):
+        """Index of the candidate nearest to a click, or ``None``.
+
+        ``x``/``y`` are in displayed-image pixels; ``display_scale`` is
+        displayed / original.  Distance is to the segment, not to its infinite
+        line, so clicking above a short window mullion does not select it.
+        """
+        if len(self.vert) == 0:
+            return None
+        inv = self.scale / max(display_scale, 1e-9)
+        p = np.array([x * inv, y * inv])
+        seg = self.vert.seg
+        a, b = seg[:, :2], seg[:, 2:]
+        ab = b - a
+        t = np.clip(np.sum((p - a) * ab, axis=1) / np.maximum(np.sum(ab * ab, axis=1), 1e-9), 0, 1)
+        closest = a + ab * t[:, None]
+        d = np.linalg.norm(closest - p, axis=1)
+        i = int(np.argmin(d))
+        return i if d[i] <= radius * inv else None
+
+    # -- current correction ----------------------------------------------
+    def current_angles(self):
+        """``(roll, pitch, focal_px)`` actually in force, limits applied."""
+        if self.mode == MANUAL:
+            roll, pitch = self.manual_roll, self.manual_pitch
+            f35 = self.manual_focal_35mm
+            f = M.focal_px_from_35mm(f35, self.w, self.h) if f35 > 0 else (
+                self.model.f if self.model and self.model.f
+                else M.focal_px_from_35mm(self.settings.default_focal_35mm, self.w, self.h))
+            return roll, pitch, f, False
+        if self.model is None or not self.model.f:
+            return 0.0, 0.0, M.focal_px_from_35mm(self.settings.default_focal_35mm,
+                                                  self.w, self.h), False
+        guessed = self.model.f_source in ("default", "prior", "none", "refined")
+        roll, pitch, clamped = W.limit(self.model.roll, self.model.pitch,
+                                       self.settings, guessed)
+        return roll, pitch, self.model.f, clamped
+
+    def would_skip(self):
+        """``None`` if the image would be corrected, else the reason it would not."""
+        if self.mode == MANUAL:
+            return None
+        if self.model is None:
+            return "no model"
+        if self.model.confidence < self.settings.min_confidence:
+            weakest = self.model.diagnostics.get("weakest_term", "")
+            return (self.model.diagnostics.get("reason", "low confidence") +
+                    f" (conf={self.model.confidence:.2f}" +
+                    (f"; weakest: {weakest})" if weakest else ")"))
+        roll, pitch, _, _ = self.current_angles()
+        if math.degrees(math.hypot(roll, pitch)) < self.settings.min_correction_deg:
+            return "already upright"
+        return None
+
+    # -- rendering -------------------------------------------------------
+    def render_before(self, max_edge=900, show_lines=True):
+        img = self.bgr
+        if not show_lines:
+            return _fit(img, max_edge)
+        struck = self.vert.subset(~self.enabled)
+        used = self.vert.subset(self.enabled)
+        m = self.model
+        canvas = self.bgr.copy()
+        inv = 1.0 / self.scale
+        if len(self.horiz):
+            PV._draw_lines(canvas, self.horiz.seg * inv, PV.BLUE, 1)
+        if len(struck):
+            PV._draw_lines(canvas, struck.seg * inv, (120, 120, 120), 1)
+        if len(used):
+            inl = m.vert_inliers[self.enabled] if m is not None else np.zeros(len(used), bool)
+            PV._draw_lines(canvas, used.seg[~inl] * inv, PV.YELLOW, 1)
+            PV._draw_lines(canvas, used.seg[inl] * inv, PV.GREEN, 2)
+        if m is not None and m.f:
+            K = G.intrinsics(m.f, self.w / 2.0, self.h / 2.0)
+            PV._draw_infinite_line(canvas, G.horizon_line(m.up, K), PV.MAGENTA, 2)
+        return _fit(canvas, max_edge)
+
+    def render_after(self, max_edge=900):
+        roll, pitch, f, _ = self.current_angles()
+        if abs(roll) < 1e-9 and abs(pitch) < 1e-9:
+            return _fit(self.bgr, max_edge)
+        # render the preview from a reduced copy: a 24 MP warp per slider tick
+        # is unusable, and the geometry is scale invariant apart from f
+        s = min(1.0, float(max_edge) / max(self.w, self.h))
+        small = cv2.resize(self.bgr, (max(1, int(self.w * s)), max(1, int(self.h * s))),
+                           interpolation=cv2.INTER_AREA) if s < 1.0 else self.bgr
+        sh, sw = small.shape[:2]
+        H = W.build(sw, sh, f * s, roll, pitch)
+        planned = W.plan(sw, sh, H, self.settings)
+        if planned is None:
+            return _fit(self.bgr, max_edge)
+        H_total, ow, oh, _, _ = planned
+        return W.apply(small, H_total, ow, oh, self.settings)
+
+    def render_pair(self, max_edge=900):
+        return self.render_before(max_edge), self.render_after(max_edge)
+
+    def status_text(self):
+        roll, pitch, f, clamped = self.current_angles()
+        f35 = M.focal_35mm_from_px(f, self.w, self.h) if f else 0.0
+        skip = self.would_skip()
+        conf = self.model.confidence if self.model else 0.0
+        src = self.model.f_source if self.model else "-"
+        head = "MANUAL" if self.mode == MANUAL else ("SKIP" if skip else "AUTO")
+        parts = [f"{head}  roll={math.degrees(roll):+.2f}deg  pitch={math.degrees(pitch):+.2f}deg",
+                 f"f={f35:.0f}mm ({src if self.mode == AUTO else 'manual'})  conf={conf:.2f}  "
+                 f"lines={int(self.enabled.sum())}/{len(self.vert)}"]
+        if clamped:
+            parts.append("correction hit the configured limit")
+        if skip:
+            parts.append(f"would skip: {skip}")
+        return "\n".join(parts)
+
+    # -- output ----------------------------------------------------------
+    def save(self, dst_path: str):
+        """Write the corrected image using whatever is currently in force."""
+        roll, pitch, f, _ = self.current_angles()
+        if abs(roll) < 1e-12 and abs(pitch) < 1e-12:
+            IO.copy_through(self.path, dst_path)
+            return dst_path
+        H = W.build(self.w, self.h, f, roll, pitch)
+        planned = W.plan(self.w, self.h, H, self.settings)
+        if planned is None:
+            IO.copy_through(self.path, dst_path)
+            return dst_path
+        H_total, ow, oh, _, _ = planned
+        out = W.apply(self.bgr, H_total, ow, oh, self.settings)
+        os.makedirs(os.path.dirname(os.path.abspath(dst_path)) or ".", exist_ok=True)
+        IO.save(dst_path, out, self.src, self.settings)
+        return dst_path
+
+
+def _fit(img, max_edge):
+    s = min(1.0, float(max_edge) / max(img.shape[:2]))
+    if s >= 1.0:
+        return img
+    return cv2.resize(img, (max(1, int(img.shape[1] * s)), max(1, int(img.shape[0] * s))),
+                      interpolation=cv2.INTER_AREA)

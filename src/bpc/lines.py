@@ -1,0 +1,248 @@
+"""Line segment detection, merging, classification and weighting.
+
+The detector chain is LSD -> FastLineDetector -> Canny+HoughLinesP.  LSD is the
+accurate one and is what darktable's ashift uses; the other two only exist
+because OpenCV dropped and re-added LSD several times and because contrib
+builds are not always present.  Whichever runs, everything downstream sees the
+same ``(N, 4)`` endpoint array.
+"""
+from __future__ import annotations
+
+import math
+
+import cv2
+import numpy as np
+
+from . import geometry as G
+
+
+# --------------------------------------------------------------------------
+# detection
+# --------------------------------------------------------------------------
+def _lsd(gray: np.ndarray):
+    try:
+        det = cv2.createLineSegmentDetector(cv2.LSD_REFINE_ADV, _scale=0.8,
+                                            _sigma_scale=0.6, _quant=2.0,
+                                            _ang_th=22.5, _density_th=0.7,
+                                            _n_bins=1024)
+    except Exception:
+        try:
+            det = cv2.createLineSegmentDetector()
+        except Exception:
+            return None
+    try:
+        out = det.detect(gray)
+    except Exception:
+        return None
+    seg = out[0] if isinstance(out, tuple) else out
+    if seg is None or len(seg) == 0:
+        return None
+    return np.asarray(seg, dtype=float).reshape(-1, 4), "lsd"
+
+
+def _fld(gray: np.ndarray):
+    try:
+        det = cv2.ximgproc.createFastLineDetector()
+    except Exception:
+        return None
+    try:
+        seg = det.detect(gray)
+    except Exception:
+        return None
+    if seg is None or len(seg) == 0:
+        return None
+    return np.asarray(seg, dtype=float).reshape(-1, 4), "fld"
+
+
+def _hough(gray: np.ndarray, min_len: float):
+    v = float(np.median(gray))
+    lo = int(max(0, 0.66 * v))
+    hi = int(min(255, 1.33 * v))
+    edges = cv2.Canny(gray, lo, hi, L2gradient=True)
+    seg = cv2.HoughLinesP(edges, 1, np.pi / 720.0, threshold=int(max(30, min_len * 0.6)),
+                          minLineLength=float(min_len), maxLineGap=float(max(3.0, min_len * 0.25)))
+    if seg is None or len(seg) == 0:
+        return None
+    return np.asarray(seg, dtype=float).reshape(-1, 4), "hough"
+
+
+def detect_segments(gray: np.ndarray, min_len: float, detector: str = "auto"):
+    """Return ``(segments, detector_name)``; segments may be empty."""
+    chain = {"auto": (_lsd, _fld), "lsd": (_lsd,), "fld": (_fld,), "hough": ()}[detector]
+    for fn in chain:
+        got = fn(gray)
+        if got is not None:
+            return got
+    got = _hough(gray, min_len)
+    if got is not None:
+        return got
+    return np.zeros((0, 4)), "none"
+
+
+# --------------------------------------------------------------------------
+# cleaning
+# --------------------------------------------------------------------------
+def drop_border_segments(seg: np.ndarray, w: int, h: int, margin: float) -> np.ndarray:
+    """Discard segments that hug the image frame.
+
+    The frame itself, vignetting boundaries and sensor edges produce perfectly
+    straight, perfectly vertical lines that carry no information about the
+    scene but win on length, so they would dominate a length-weighted fit.
+    darktable drops these too.
+    """
+    if len(seg) == 0 or margin <= 0:
+        return seg
+    mid = G.segment_midpoints(seg)
+    near_x = (mid[:, 0] < margin) | (mid[:, 0] > w - margin)
+    near_y = (mid[:, 1] < margin) | (mid[:, 1] > h - margin)
+    span_x = np.abs(seg[:, 2] - seg[:, 0])
+    span_y = np.abs(seg[:, 3] - seg[:, 1])
+    return seg[~((near_x & (span_x < margin * 2)) | (near_y & (span_y < margin * 2)))]
+
+
+def merge_collinear(seg: np.ndarray, angle_tol_deg: float = 2.0,
+                    offset_tol: float = 3.0, gap_tol: float = 24.0) -> np.ndarray:
+    """Join segments that are the same physical edge broken into pieces.
+
+    LSD readily splits a six storey facade corner into eight fragments at every
+    balcony.  Un-merged, that edge is eight short lines whose individual
+    directions are noisy; merged, it is one long, precisely oriented line.
+    Since the fit is length-weighted this materially changes the answer.
+    """
+    if len(seg) < 2:
+        return seg
+    ang = np.arctan2(seg[:, 3] - seg[:, 1], seg[:, 2] - seg[:, 0]) % math.pi
+    length = G.segment_lengths(seg)
+    order = np.argsort(-length)
+    used = np.zeros(len(seg), dtype=bool)
+    out = []
+    atol = math.radians(angle_tol_deg)
+    for i in order:
+        if used[i]:
+            continue
+        used[i] = True
+        ai = ang[i]
+        d = np.array([math.cos(ai), math.sin(ai)])
+        n = np.array([-d[1], d[0]])
+        p0 = seg[i, :2]
+        ti = (seg[i].reshape(2, 2) - p0) @ d
+        lo, hi = float(ti.min()), float(ti.max())
+        members = [i]
+        # Grow the run rather than testing every fragment against the seed.
+        # A facade corner broken at each of six balconies is a *chain*: piece
+        # three is 75 px from the seed but only 15 px from piece two, so a
+        # seed-only test merges two of the six and leaves four short, noisily
+        # oriented lines behind -- which then out-vote the one long precise one.
+        grew = True
+        while grew:
+            grew = False
+            for j in order:
+                if used[j]:
+                    continue
+                da = abs(ang[j] - ai)
+                da = min(da, math.pi - da)
+                if da > atol:
+                    continue
+                q = seg[j].reshape(2, 2) - p0
+                if np.max(np.abs(q @ n)) > offset_tol:
+                    continue
+                tj = q @ d
+                gap = max(float(tj.min()) - hi, lo - float(tj.max()))
+                if gap > gap_tol:
+                    continue
+                used[j] = True
+                members.append(j)
+                lo, hi = min(lo, float(tj.min())), max(hi, float(tj.max()))
+                grew = True
+        a = p0 + d * lo
+        b = p0 + d * hi
+        out.append([a[0], a[1], b[0], b[1]])
+    return np.asarray(out, dtype=float)
+
+
+# --------------------------------------------------------------------------
+# classification / weighting
+# --------------------------------------------------------------------------
+class LineSet:
+    """Segments plus everything derived from them, computed once."""
+
+    __slots__ = ("seg", "lines", "mid", "dir", "length", "weight", "angle_to_vert")
+
+    def __init__(self, seg: np.ndarray):
+        self.seg = seg
+        self.lines = G.lines_from_segments(seg) if len(seg) else np.zeros((0, 3))
+        self.mid = G.segment_midpoints(seg) if len(seg) else np.zeros((0, 2))
+        self.dir = G.segment_directions(seg) if len(seg) else np.zeros((0, 2))
+        self.length = G.segment_lengths(seg) if len(seg) else np.zeros(0)
+        self.weight = self.length.copy()
+        # angle to the image vertical axis, in [0, pi/2]
+        if len(seg):
+            a = np.abs(np.arctan2(self.dir[:, 0], self.dir[:, 1]))
+            self.angle_to_vert = np.minimum(a, math.pi - a)
+        else:
+            self.angle_to_vert = np.zeros(0)
+
+    def __len__(self):
+        return len(self.seg)
+
+    def subset(self, mask: np.ndarray) -> "LineSet":
+        out = LineSet.__new__(LineSet)
+        out.seg = self.seg[mask]
+        out.lines = self.lines[mask]
+        out.mid = self.mid[mask]
+        out.dir = self.dir[mask]
+        out.length = self.length[mask]
+        out.weight = self.weight[mask]
+        out.angle_to_vert = self.angle_to_vert[mask]
+        return out
+
+
+def angular_prior(angle: np.ndarray, window: float, softness: float = 0.6) -> np.ndarray:
+    """Down-weight lines the further they lean away from the expected axis.
+
+    A hard angular window alone throws away a 31 deg facade edge and fully
+    trusts a 29 deg roof rafter.  A smooth prior inside the window makes the
+    fit prefer the lines that were probably vertical in the world, which is the
+    "nach Laenge *und* Winkel gewichten" part.
+    """
+    x = np.clip(angle / max(window, 1e-6), 0.0, 1.0)
+    return np.exp(-(x * x) / (2.0 * softness * softness))
+
+
+def split_by_orientation(ls: LineSet, vertical_window_deg: float,
+                         horizontal_window_deg: float):
+    """Return ``(vertical, horizontal)`` line sets with weights already applied."""
+    if len(ls) == 0:
+        return ls, ls
+    vw = math.radians(vertical_window_deg)
+    hw = math.radians(horizontal_window_deg)
+    a_v = ls.angle_to_vert
+    a_h = math.pi / 2.0 - a_v
+    vmask = a_v <= vw
+    hmask = a_h <= hw
+    vert = ls.subset(vmask)
+    horiz = ls.subset(hmask)
+    if len(vert):
+        vert.weight = vert.length * angular_prior(vert.angle_to_vert, vw)
+    if len(horiz):
+        horiz.weight = horiz.length * angular_prior(math.pi / 2.0 - horiz.angle_to_vert, hw)
+    return vert, horiz
+
+
+def prepare(gray: np.ndarray, settings) -> tuple:
+    """Full front end: detect, clean, merge, classify.  Returns
+    ``(all_lines, vertical, horizontal, detector_name)``."""
+    h, w = gray.shape[:2]
+    min_len = max(8.0, settings.min_line_length_frac * min(w, h))
+    seg, name = detect_segments(gray, min_len, settings.detector)
+    if len(seg):
+        seg = seg[G.segment_lengths(seg) >= min_len]
+    if len(seg):
+        seg = drop_border_segments(seg, w, h, settings.border_margin_px)
+    if len(seg) and settings.merge_lines:
+        seg = merge_collinear(seg, gap_tol=max(12.0, 0.02 * max(w, h)))
+        seg = seg[G.segment_lengths(seg) >= min_len]
+    ls = LineSet(seg if len(seg) else np.zeros((0, 4)))
+    vert, horiz = split_by_orientation(ls, settings.vertical_window_deg,
+                                       settings.horizontal_window_deg)
+    return ls, vert, horiz, name
